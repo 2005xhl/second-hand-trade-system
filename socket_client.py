@@ -8,6 +8,7 @@ from tkinter import messagebox
 SERVER_IP = "10.129.106.38"
 SERVER_PORT = 8888
 BUFFER_SIZE = 1024
+HEADER_SIZE = 4
 
 
 class SocketClient:
@@ -37,9 +38,21 @@ class SocketClient:
             if not self.connected or not self.client:
                 return "未连接服务器"
             try:
-                payload = f"{cmd}|{json.dumps(body, ensure_ascii=False)}"
-                self.client.send(payload.encode("utf-8"))
-                data = self.client.recv(BUFFER_SIZE).decode("utf-8")
+                payload_str = f"{cmd}|{json.dumps(body, ensure_ascii=False)}"
+                payload = payload_str.encode("utf-8")
+                header = len(payload).to_bytes(HEADER_SIZE, "big")
+                # 发送：先发长度头，再发正文
+                self.client.sendall(header + payload)
+
+                # 接收：同样先读长度，再按长度读满
+                resp_header = self._recv_exact(HEADER_SIZE)
+                if not resp_header:
+                    return "发送/接收失败: 服务器无响应"
+                resp_len = int.from_bytes(resp_header, "big")
+                resp_payload = self._recv_exact(resp_len)
+                if resp_payload is None or len(resp_payload) != resp_len:
+                    return "发送/接收失败: 响应不完整"
+                data = resp_payload.decode("utf-8")
                 return data
             except Exception as e:
                 self.connected = False
@@ -50,6 +63,18 @@ class SocketClient:
                         pass
                 self.client = None
                 return f"发送/接收失败: {e}"
+
+    def _recv_exact(self, size: int) -> bytes | None:
+        """循环读取指定长度，避免粘包/拆包"""
+        chunks = []
+        total = 0
+        while total < size:
+            part = self.client.recv(size - total)
+            if not part:
+                return None
+            chunks.append(part)
+            total += len(part)
+        return b"".join(chunks)
 
     def close(self):
         with self.lock:
@@ -67,7 +92,8 @@ class ClientUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Socket 客户端测试")
-        self.geometry("420x260")
+        # 加大窗口，避免按钮被遮挡
+        self.geometry("520x320")
         self.resizable(False, False)
 
         self.client = SocketClient()
@@ -92,19 +118,22 @@ class ClientUI(tk.Tk):
         # 指令发送
         frm_cmd = tk.LabelFrame(self, text="指令发送", padx=10, pady=10)
         frm_cmd.pack(fill=tk.X, padx=12, pady=5)
+        # 让输入框可伸缩，按钮不被挤出视野
+        for i in range(5):
+            frm_cmd.columnconfigure(i, weight=1)
 
         tk.Label(frm_cmd, text="指令头:").grid(row=0, column=0, sticky="e")
         self.cmd_entry = tk.Entry(frm_cmd, width=12)
-        self.cmd_entry.grid(row=0, column=1, padx=5)
+        self.cmd_entry.grid(row=0, column=1, padx=5, sticky="we")
         self.cmd_entry.insert(0, "TEST")
 
         tk.Label(frm_cmd, text="JSON内容:").grid(row=0, column=2, sticky="e")
-        self.body_entry = tk.Entry(frm_cmd, width=28)
-        self.body_entry.grid(row=0, column=3, padx=5)
+        self.body_entry = tk.Entry(frm_cmd, width=32)
+        self.body_entry.grid(row=0, column=3, padx=5, sticky="we")
         self.body_entry.insert(0, '{"msg":"hello"}')
 
         self.btn_send = tk.Button(frm_cmd, text="发送指令", width=12, command=self.on_send)
-        self.btn_send.grid(row=0, column=4, padx=8)
+        self.btn_send.grid(row=0, column=4, padx=8, sticky="e")
 
         # 响应展示
         frm_resp = tk.LabelFrame(self, text="响应结果", padx=10, pady=10)
