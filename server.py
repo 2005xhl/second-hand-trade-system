@@ -6,7 +6,21 @@ import sys
 # =================配置区域=================
 SERVER_IP = '10.129.106.38'  
 SERVER_PORT = 8888       # 监听端口，确保不被占用
-BUFFER_SIZE = 1024       # 一次接收的数据大小
+BUFFER_SIZE = 1024       # 单次 socket recv 尝试读取的大小
+HEADER_SIZE = 4          # 前置 4 字节长度头
+
+
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    """循环读取指定长度，避免拆包问题"""
+    chunks = []
+    total = 0
+    while total < size:
+        part = sock.recv(size - total)
+        if not part:
+            break
+        chunks.append(part)
+        total += len(part)
+    return b"".join(chunks)
 # =========================================
 
 def handle_client_request(client_socket, client_addr):
@@ -18,38 +32,45 @@ def handle_client_request(client_socket, client_addr):
     
     while True:
         try:
-            # 1. 接收客户端发来的数据
-            # decode('utf-8') 将字节流转换为字符串
-            data = client_socket.recv(BUFFER_SIZE).decode('utf-8')
-            
-            # 如果收到的数据为空，说明客户端断开了连接
-            if not data:
+            # 1. 先读定长头，得到正文长度
+            header = recv_exact(client_socket, HEADER_SIZE)
+            if not header:
                 print(f"[断开连接] 客户端 {client_addr} 下线了")
                 break
-            
+            body_len = int.from_bytes(header, "big")
+            if body_len <= 0:
+                print(f"[异常数据] 客户端 {client_addr} 发送了非法长度")
+                break
+
+            # 2. 再按长度读满正文，避免拆包/粘包
+            payload = recv_exact(client_socket, body_len)
+            if len(payload) != body_len:
+                print(f"[异常数据] 客户端 {client_addr} 数据长度不完整")
+                break
+
+            data = payload.decode("utf-8")
             print(f"[收到消息] 来自 {client_addr}: {data}")
-            
-            # 2. 指令解析逻辑 
-            # 假设通信协议格式为：指令头|JSON数据 (例如: LOGIN|{"user":"test"})
+
+            # 3. 指令解析逻辑
             if "|" in data:
-                # 分割指令头和数据体，只分割一次
                 cmd_type, json_body = data.split("|", 1)
-                
-                # 这里暂时做简单响应，后续会连接数据库
+
                 response_data = {
                     "code": 200,
                     "msg": f"服务器已收到指令: {cmd_type}",
                     "original_data": json_body
                 }
-                
-                # 3. 发送响应给客户端
-                # 将字典转为JSON字符串发送，保持格式一致：指令头|响应数据
-                response_str = f"{cmd_type}|{json.dumps(response_data)}"
-                client_socket.send(response_str.encode('utf-8'))
-                
+
+                # 4. 回包同样加长度头
+                response_str = f"{cmd_type}|{json.dumps(response_data, ensure_ascii=False)}"
+                resp_bytes = response_str.encode("utf-8")
+                resp_header = len(resp_bytes).to_bytes(HEADER_SIZE, "big")
+                client_socket.sendall(resp_header + resp_bytes)
             else:
-                # 格式不正确时的处理
-                client_socket.send("ERROR|格式错误，请使用 '指令|数据' 格式".encode('utf-8'))
+                err_msg = "ERROR|格式错误，请使用 '指令|数据' 格式"
+                resp_bytes = err_msg.encode("utf-8")
+                resp_header = len(resp_bytes).to_bytes(HEADER_SIZE, "big")
+                client_socket.sendall(resp_header + resp_bytes)
 
         except ConnectionResetError:
             print(f"[异常断开] 客户端 {client_addr} 强行关闭了连接")
