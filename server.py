@@ -2,12 +2,23 @@ import socket
 import threading
 import json
 import sys
+from db_utils import DBManager
 
 # =================配置区域=================
 SERVER_IP = '10.129.106.38'  
 SERVER_PORT = 8888       # 监听端口，确保不被占用
 BUFFER_SIZE = 1024       # 单次 socket recv 尝试读取的大小
 HEADER_SIZE = 4          # 前置 4 字节长度头
+
+# 数据库配置
+DB_HOST = "127.0.0.1"
+DB_PORT = 3306
+DB_USER = "root"
+DB_PASSWORD = "123456"
+DB_NAME = "used_goods_platform"
+
+# 全局数据库管理器实例
+db_manager = DBManager(DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME)
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -54,12 +65,129 @@ def handle_client_request(client_socket, client_addr):
             # 3. 指令解析逻辑
             if "|" in data:
                 cmd_type, json_body = data.split("|", 1)
+                
+                try:
+                    body = json.loads(json_body) if json_body else {}
+                except json.JSONDecodeError:
+                    response_data = {"code": 400, "msg": "JSON格式错误"}
+                    response_str = f"{cmd_type}|{json.dumps(response_data, ensure_ascii=False)}"
+                    resp_bytes = response_str.encode("utf-8")
+                    resp_header = len(resp_bytes).to_bytes(HEADER_SIZE, "big")
+                    client_socket.sendall(resp_header + resp_bytes)
+                    continue
 
-                response_data = {
-                    "code": 200,
-                    "msg": f"服务器已收到指令: {cmd_type}",
-                    "original_data": json_body
-                }
+                # ================= 任务7：用户注册/登录/权限逻辑 =================
+                
+                if cmd_type == "REGISTER":
+                    # 注册逻辑：校验用户名唯一性，密码MD5加密后存入数据库
+                    username = body.get("username")
+                    password = body.get("password")
+                    phone = body.get("phone")  # 可选，可能是 null
+                    nickname = body.get("nickname")  # 可选
+                    
+                    # 处理前端传来的 null 值（JSON 的 null 在 Python 中可能是 None）
+                    if phone is None or phone == "null" or phone == "":
+                        phone = None
+                    
+                    print(f"[SERVER DEBUG] 收到注册请求: username={username}, nickname={nickname}, phone={phone}")
+                    
+                    if not username or not password:
+                        response_data = {"code": 400, "msg": "缺少用户名或密码"}
+                        print(f"[SERVER DEBUG] 注册失败: 缺少用户名或密码")
+                    else:
+                        success, msg, error_code = db_manager.register_user(username, password, phone, nickname)
+                        print(f"[SERVER DEBUG] 注册结果: success={success}, msg={msg}, error_code={error_code}")
+                        if success:
+                            # 成功：返回200
+                            response_data = {"code": 200, "msg": msg}
+                        else:
+                            # 失败：根据错误类型返回不同错误码
+                            # code 401: 用户名已存在（不可重复注册）
+                            # code 500: 服务器内部错误（数据库连接失败、SQL执行失败等）
+                            response_data = {
+                                "code": error_code if error_code else 500,
+                                "msg": msg
+                            }
+                            
+                elif cmd_type == "LOGIN":
+                    # 登录逻辑：校验用户名密码，返回用户ID和角色
+                    # 1. 用户输入用户名和密码，点击"登录"
+                    # 2. 客户端通过 socket 发送 LOGIN 命令到服务器
+                    # 3. 服务器验证：查询数据库检查用户是否存在、验证密码（MD5哈希比对）、检查账号状态
+                    # 4. 服务器返回响应：成功（code 200）返回用户信息，失败（code 401）用户名或密码错误，失败（code 403）账号被封禁
+                    username = body.get("username")
+                    password = body.get("password")
+                    
+                    if not username or not password:
+                        response_data = {"code": 400, "msg": "缺少用户名或密码"}
+                    else:
+                        success, msg, user_info, error_code = db_manager.validate_login(username, password)
+                        if success:
+                            # 成功（code 200）：返回用户信息
+                            response_data = {
+                                "code": 200,
+                                "msg": msg,
+                                "data": user_info  # 包含 user_id, role, username
+                            }
+                        else:
+                            # 失败：根据错误类型返回不同错误码
+                            # code 401: 用户名或密码错误
+                            # code 403: 账号被封禁
+                            response_data = {
+                                "code": error_code if error_code else 401,
+                                "msg": msg
+                            }
+                            
+                elif cmd_type == "UPDATE_PROFILE":
+                    # 更新用户资料（昵称修改）
+                    # 用户登录后，发送 UPDATE_PROFILE 指令修改昵称
+                    # 请求格式: UPDATE_PROFILE|{"username": "1234", "nickname": "kaka"}
+                    username = body.get("username")
+                    nickname = body.get("nickname")
+                    
+                    print(f"[SERVER DEBUG] 收到更新昵称请求: username={username}, nickname={nickname}")
+                    
+                    if not nickname:
+                        response_data = {"code": 400, "msg": "缺少昵称参数"}
+                    elif not username:
+                        response_data = {"code": 400, "msg": "缺少用户名参数，请先登录"}
+                    else:
+                        success, msg = db_manager.update_user_nickname(username, nickname)
+                        print(f"[SERVER DEBUG] 更新昵称结果: success={success}, msg={msg}")
+                        if success:
+                            response_data = {"code": 200, "msg": msg}
+                        else:
+                            response_data = {"code": 400, "msg": msg}
+                            
+                elif cmd_type == "USER_MANAGE":
+                    # 管理员用户管理接口（查询所有用户、封号/解封）
+                    action = body.get("action")
+                    user_id = body.get("user_id")
+                    
+                    if action == "LIST":
+                        # 查询所有用户
+                        users = db_manager.list_users()
+                        response_data = {"code": 200, "msg": "查询成功", "users": users}
+                    elif action == "BLOCK":
+                        # 封号
+                        if not user_id:
+                            response_data = {"code": 400, "msg": "缺少用户ID"}
+                        else:
+                            success, msg = db_manager.update_user_status(user_id, "blocked")
+                            response_data = {"code": 200 if success else 400, "msg": msg}
+                    elif action == "UNBLOCK":
+                        # 解封
+                        if not user_id:
+                            response_data = {"code": 400, "msg": "缺少用户ID"}
+                        else:
+                            success, msg = db_manager.update_user_status(user_id, "active")
+                            response_data = {"code": 200 if success else 400, "msg": msg}
+                    else:
+                        response_data = {"code": 400, "msg": f"未知的管理员动作: {action}"}
+                        
+                else:
+                    # 未知指令
+                    response_data = {"code": 404, "msg": f"未知指令: {cmd_type}"}
 
                 # 4. 回包同样加长度头
                 response_str = f"{cmd_type}|{json.dumps(response_data, ensure_ascii=False)}"
