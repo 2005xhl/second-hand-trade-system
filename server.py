@@ -2,6 +2,10 @@ import socket
 import threading
 import json
 import sys
+import os
+import base64
+import struct
+from datetime import datetime
 from db_utils import DBManager
 
 # =================配置区域=================
@@ -19,6 +23,21 @@ DB_NAME = "used_goods_platform"
 
 # 全局数据库管理器实例
 db_manager = DBManager(DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME)
+# 确保默认管理员账号存在（admin/admin123）
+try:
+    db_manager.ensure_admin_account("admin", "admin123")
+except Exception as e:
+    print(f"[WARN] 初始化管理员账号失败: {e}")
+
+# 图片存储配置
+IMAGES_DIR = "uploads/goods_images"  # 商品图片存储目录
+CHUNK_SIZE = 8192  # 图片分片大小（8KB）
+
+# 确保图片目录存在
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
+# 图片分片临时存储（用于拼接）
+image_chunks = {}  # {chunk_id: {chunks: [], total_size: int, filename: str}}
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -184,6 +203,247 @@ def handle_client_request(client_socket, client_addr):
                             response_data = {"code": 200 if success else 400, "msg": msg}
                     else:
                         response_data = {"code": 400, "msg": f"未知的管理员动作: {action}"}
+                
+                elif cmd_type == "GOODS_ADD":
+                    # 发布商品：接收商品信息，存入数据库（状态设为待审核）
+                    user_id = body.get("user_id")
+                    title = body.get("title")
+                    description = body.get("description")
+                    category = body.get("category")
+                    price = body.get("price")
+                    brand = body.get("brand")
+                    original_price = body.get("original_price")
+                    purchase_time = body.get("purchase_time")
+                    stock_quantity = body.get("stock_quantity", 1)
+                    img_path = body.get("img_path")  # 主图路径（可选）
+                    
+                    print(f"[SERVER DEBUG] 收到发布商品请求: user_id={user_id}, title={title}")
+                    
+                    if not user_id or not title or not category or price is None:
+                        response_data = {"code": 400, "msg": "缺少必填参数（user_id, title, category, price）"}
+                    else:
+                        success, msg, goods_id = db_manager.add_goods(
+                            user_id, title, description, category, float(price),
+                            brand, float(original_price) if original_price else None,
+                            purchase_time, stock_quantity, img_path
+                        )
+                        print(f"[SERVER DEBUG] 商品发布结果: success={success}, goods_id={goods_id}")
+                        if success:
+                            response_data = {"code": 200, "msg": msg, "goods_id": goods_id}
+                        else:
+                            response_data = {"code": 400, "msg": msg}
+                
+                elif cmd_type == "GOODS_GET":
+                    # 获取商品列表：按分类/页码查询，返回商品元信息（含图片路径）
+                    category = body.get("category")  # 可选
+                    page = body.get("page", 1)
+                    page_size = body.get("page_size", 20)
+                    status = body.get("status")  # 可选，如 'on_sale' 只查询在售商品
+                    
+                    print(f"[SERVER DEBUG] 收到查询商品列表请求: category={category}, page={page}")
+                    
+                    success, msg, goods_list, total_count = db_manager.get_goods_list(
+                        category, page, page_size, status
+                    )
+                    if success:
+                        response_data = {
+                            "code": 200,
+                            "msg": msg,
+                            "data": goods_list,
+                            "total": total_count,
+                            "page": page,
+                            "page_size": page_size
+                        }
+                    else:
+                        response_data = {"code": 400, "msg": msg}
+                
+                elif cmd_type == "GOODS_AUDIT":
+                    # 管理员审核：更新商品状态（待审核→在售/驳回）
+                    goods_id = body.get("goods_id")
+                    status = body.get("status")  # 'on_sale' 或 'rejected'
+                    admin_user_id = body.get("admin_user_id")  # 可选
+                    
+                    print(f"[SERVER DEBUG] 收到商品审核请求: goods_id={goods_id}, status={status}")
+                    
+                    if not goods_id or not status:
+                        response_data = {"code": 400, "msg": "缺少商品ID或状态参数"}
+                    elif status not in ('on_sale', 'rejected'):
+                        response_data = {"code": 400, "msg": "无效的状态值，只能设置为 'on_sale'（在售）或 'rejected'（驳回）"}
+                    else:
+                        success, msg = db_manager.audit_goods(goods_id, status, admin_user_id)
+                        print(f"[SERVER DEBUG] 商品审核结果: success={success}, msg={msg}")
+                        if success:
+                            response_data = {"code": 200, "msg": msg}
+                        else:
+                            response_data = {"code": 400, "msg": msg}
+                
+                elif cmd_type == "ORDER_ADD":
+                    # 下单：校验商品在售，创建订单（待付款），并将商品置为已售出
+                    buyer_id = body.get("buyer_id")
+                    goods_id = body.get("goods_id")
+                    quantity = body.get("quantity", 1)
+
+                    print(f"[SERVER DEBUG] 收到下单请求: buyer_id={buyer_id}, goods_id={goods_id}, quantity={quantity}")
+
+                    if not buyer_id or not goods_id:
+                        response_data = {"code": 400, "msg": "缺少买家或商品ID"}
+                    else:
+                        success, msg, order_id, order_no = db_manager.add_order(buyer_id, goods_id, quantity)
+                        if success:
+                            response_data = {
+                                "code": 200,
+                                "msg": msg,
+                                "order_id": order_id,
+                                "order_no": order_no
+                            }
+                        else:
+                            response_data = {"code": 400, "msg": msg}
+
+                elif cmd_type == "ORDER_UPDATE":
+                    # 更新订单状态：pending_payment → pending_shipment → pending_receipt → completed
+                    order_id = body.get("order_id")
+                    status = body.get("status")
+
+                    print(f"[SERVER DEBUG] 收到订单状态更新请求: order_id={order_id}, status={status}")
+
+                    if not order_id or not status:
+                        response_data = {"code": 400, "msg": "缺少订单ID或状态参数"}
+                    else:
+                        success, msg = db_manager.update_order_status(order_id, status)
+                        response_data = {"code": 200 if success else 400, "msg": msg}
+
+                elif cmd_type == "ORDER_GET":
+                    # 获取我的订单：按用户ID和可选状态查询
+                    buyer_id = body.get("buyer_id")
+                    status = body.get("status")  # 可选
+
+                    print(f"[SERVER DEBUG] 收到查询订单请求: buyer_id={buyer_id}, status={status}")
+
+                    if not buyer_id:
+                        response_data = {"code": 400, "msg": "缺少用户ID"}
+                    else:
+                        success, msg, orders = db_manager.get_orders(buyer_id, status)
+                        if success:
+                            response_data = {"code": 200, "msg": msg, "data": orders}
+                        else:
+                            response_data = {"code": 400, "msg": msg}
+
+                elif cmd_type == "COLLECT_ADD":
+                    user_id = body.get("user_id")
+                    goods_id = body.get("goods_id")
+                    print(f"[SERVER DEBUG] 收到收藏请求: user_id={user_id}, goods_id={goods_id}")
+                    if not user_id or not goods_id:
+                        response_data = {"code": 400, "msg": "缺少用户ID或商品ID"}
+                    else:
+                        success, msg = db_manager.add_collect(user_id, goods_id)
+                        response_data = {"code": 200 if success else 400, "msg": msg}
+
+                elif cmd_type == "COLLECT_GET":
+                    user_id = body.get("user_id")
+                    print(f"[SERVER DEBUG] 收到查询收藏请求: user_id={user_id}")
+                    if not user_id:
+                        response_data = {"code": 400, "msg": "缺少用户ID"}
+                    else:
+                        success, msg, collects = db_manager.get_collects(user_id)
+                        if success:
+                            response_data = {"code": 200, "msg": msg, "data": collects}
+                        else:
+                            response_data = {"code": 400, "msg": msg}
+
+                elif cmd_type == "COLLECT_DEL":
+                    user_id = body.get("user_id")
+                    goods_id = body.get("goods_id")
+                    print(f"[SERVER DEBUG] 收到取消收藏请求: user_id={user_id}, goods_id={goods_id}")
+                    if not user_id or not goods_id:
+                        response_data = {"code": 400, "msg": "缺少用户ID或商品ID"}
+                    else:
+                        success, msg = db_manager.del_collect(user_id, goods_id)
+                        response_data = {"code": 200 if success else 400, "msg": msg}
+
+                elif cmd_type == "IMAGE_UPLOAD":
+                    # 图片分片上传：接收客户端图片分片、拼接完整图片、保存到本地文件夹
+                    chunk_id = body.get("chunk_id")  # 分片唯一标识
+                    chunk_index = body.get("chunk_index")  # 分片索引（从0开始）
+                    total_chunks = body.get("total_chunks")  # 总分片数
+                    chunk_data = body.get("chunk_data")  # base64编码的分片数据
+                    filename = body.get("filename")  # 原始文件名
+                    goods_id = body.get("goods_id")  # 商品ID（可选，用于关联）
+                    is_primary = body.get("is_primary", 0)  # 是否为主图
+                    display_order = body.get("display_order", 0)  # 显示顺序
+                    
+                    print(f"[SERVER DEBUG] 收到图片分片: chunk_id={chunk_id}, chunk_index={chunk_index}/{total_chunks}")
+                    
+                    if not chunk_id or chunk_index is None or total_chunks is None or not chunk_data:
+                        response_data = {"code": 400, "msg": "缺少分片参数"}
+                    else:
+                        try:
+                            # 解码base64数据
+                            chunk_bytes = base64.b64decode(chunk_data)
+                            
+                            # 初始化或更新分片存储
+                            if chunk_id not in image_chunks:
+                                image_chunks[chunk_id] = {
+                                    "chunks": [None] * total_chunks,
+                                    "total_size": 0,
+                                    "filename": filename or f"image_{chunk_id}.jpg"
+                                }
+                            
+                            # 存储分片
+                            image_chunks[chunk_id]["chunks"][chunk_index] = chunk_bytes
+                            image_chunks[chunk_id]["total_size"] += len(chunk_bytes)
+                            
+                            # 检查是否所有分片都已接收
+                            received_count = sum(1 for c in image_chunks[chunk_id]["chunks"] if c is not None)
+                            
+                            if received_count == total_chunks:
+                                # 所有分片已接收，拼接完整图片
+                                print(f"[SERVER DEBUG] 所有分片已接收，开始拼接图片: chunk_id={chunk_id}")
+                                full_image = b"".join(image_chunks[chunk_id]["chunks"])
+                                
+                                # 生成保存路径
+                                timestamp = int(datetime.now().timestamp())
+                                safe_filename = os.path.basename(image_chunks[chunk_id]["filename"])
+                                save_filename = f"{timestamp}_{safe_filename}"
+                                save_path = os.path.join(IMAGES_DIR, save_filename)
+                                
+                                # 保存图片
+                                with open(save_path, "wb") as f:
+                                    f.write(full_image)
+                                
+                                # 相对路径（用于数据库存储）
+                                relative_path = f"{IMAGES_DIR}/{save_filename}"
+                                
+                                # 如果提供了goods_id，自动添加到商品图片表
+                                if goods_id:
+                                    db_manager.add_goods_image(goods_id, relative_path, display_order, is_primary)
+                                
+                                # 清理分片数据
+                                del image_chunks[chunk_id]
+                                
+                                print(f"[SERVER DEBUG] 图片保存成功: {save_path}")
+                                response_data = {
+                                    "code": 200,
+                                    "msg": "图片上传成功",
+                                    "img_path": relative_path,
+                                    "chunk_id": chunk_id
+                                }
+                            else:
+                                # 还有分片未接收
+                                response_data = {
+                                    "code": 200,
+                                    "msg": f"分片接收成功 ({received_count}/{total_chunks})",
+                                    "received": received_count,
+                                    "total": total_chunks,
+                                    "chunk_id": chunk_id
+                                }
+                        except Exception as e:
+                            print(f"[SERVER ERROR] 图片分片处理失败: {e}")
+                            import traceback
+                            print(traceback.format_exc())
+                            response_data = {"code": 500, "msg": f"图片处理失败: {str(e)}"}
+                            # 清理失败的分片数据
+                            if chunk_id in image_chunks:
+                                del image_chunks[chunk_id]
                         
                 else:
                     # 未知指令
