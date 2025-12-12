@@ -9,9 +9,10 @@ USE `used_goods_platform`;
 CREATE TABLE `user` (
   `user_id` INT NOT NULL AUTO_INCREMENT COMMENT '用户ID（主键）',
   `username` VARCHAR(50) NOT NULL UNIQUE COMMENT '用户名（唯一）',
-  `password_hash` VARCHAR(128) NOT NULL COMMENT 'MD5加密后的密码 [cite: 64]',
+  `password_hash` VARCHAR(255) NOT NULL COMMENT '密码哈希（建议 bcrypt/argon2） [cite: 64]',
   `nickname` VARCHAR(50) DEFAULT '新用户' COMMENT '用户昵称',
   `phone` VARCHAR(20) COMMENT '联系电话',
+  `avatar_path` VARCHAR(255) COMMENT '用户头像图片保存路径',
   `role` ENUM('normal', 'admin') NOT NULL DEFAULT 'normal' COMMENT '用户角色（普通/管理员） [cite: 65]',
   `status` ENUM('active', 'blocked') NOT NULL DEFAULT 'active' COMMENT '账号状态（活跃/封禁） [cite: 66]',
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -27,15 +28,39 @@ CREATE TABLE `goods` (
   `title` VARCHAR(100) NOT NULL COMMENT '商品标题',
   `description` TEXT COMMENT '商品描述',
   `category` VARCHAR(50) NOT NULL COMMENT '商品分类',
-  `price` DECIMAL(10, 2) NOT NULL COMMENT '商品价格',
-  `img_path` VARCHAR(255) COMMENT '商品图片保存路径 [cite: 85]',
+  `brand` VARCHAR(50) COMMENT '商品品牌',
+  `price` DECIMAL(10, 2) NOT NULL COMMENT '商品价格（现价）',
+  `original_price` DECIMAL(10, 2) COMMENT '商品原价',
+  `purchase_time` DATE COMMENT '购买时间',
+  `stock_quantity` INT NOT NULL DEFAULT 1 COMMENT '库存量',
+  `sold_count` INT NOT NULL DEFAULT 0 COMMENT '已售件数',
+  `img_path` VARCHAR(255) COMMENT '商品主图保存路径（保留用于兼容，建议使用goods_images表）',
   `status` ENUM('pending_review', 'on_sale', 'sold', 'rejected') NOT NULL DEFAULT 'pending_review' COMMENT '商品状态 [cite: 82]',
-  `published_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '发布时间',
+  `create_time` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（上架提交时间）',
+  `audit_time` TIMESTAMP NULL DEFAULT NULL COMMENT '审核时间（通过/驳回时）',
+  `off_time` TIMESTAMP NULL DEFAULT NULL COMMENT '下架时间',
   PRIMARY KEY (`goods_id`),
   INDEX `idx_category` (`category`),
+  INDEX `idx_brand` (`brand`),
   -- 关联到 user 表
   FOREIGN KEY (`user_id`) REFERENCES `user`(`user_id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品表';
+
+-- 3.1. 商品图片表 (goods_images)
+-- 存储商品的多个图片路径，支持一个商品上传多张图片
+CREATE TABLE `goods_images` (
+  `image_id` INT NOT NULL AUTO_INCREMENT COMMENT '图片ID（主键）',
+  `goods_id` INT NOT NULL COMMENT '商品ID（外键）',
+  `img_path` VARCHAR(255) NOT NULL COMMENT '图片保存路径',
+  `display_order` INT NOT NULL DEFAULT 0 COMMENT '显示顺序（数字越小越靠前，用于排序）',
+  `is_primary` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否为主图（1=是，0=否）',
+  `uploaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+  PRIMARY KEY (`image_id`),
+  INDEX `idx_goods_id` (`goods_id`),
+  INDEX `idx_display_order` (`goods_id`, `display_order`),
+  -- 关联到 goods 表，删除商品时级联删除所有图片记录
+  FOREIGN KEY (`goods_id`) REFERENCES `goods`(`goods_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品图片表';
 
 -- 4. 收藏表 (collect)
 -- 存储用户收藏的商品记录
@@ -57,14 +82,22 @@ CREATE TABLE `collect` (
 -- 存储交易订单信息和状态流转
 CREATE TABLE `order` (
   `order_id` INT NOT NULL AUTO_INCREMENT COMMENT '订单ID（主键）',
+  `order_no` VARCHAR(64) NOT NULL UNIQUE COMMENT '订单编号（前端显示用，如 ORD202401150001）',
   `buyer_id` INT NOT NULL COMMENT '买家用户ID（外键）',
   `seller_id` INT NOT NULL COMMENT '卖家用户ID（外键）',
   `goods_id` INT NOT NULL COMMENT '商品ID（外键）',
+  `quantity` INT NOT NULL DEFAULT 1 COMMENT '购买数量',
   `total_price` DECIMAL(10, 2) NOT NULL COMMENT '订单总价',
   `status` ENUM('pending_payment', 'pending_shipment', 'pending_receipt', 'completed', 'canceled') NOT NULL DEFAULT 'pending_payment' COMMENT '订单状态 [cite: 106]',
-  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（下单时间）',
   `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
+  `paid_at` TIMESTAMP NULL DEFAULT NULL COMMENT '支付时间',
+  `shipped_at` TIMESTAMP NULL DEFAULT NULL COMMENT '发货时间',
+  `received_at` TIMESTAMP NULL DEFAULT NULL COMMENT '收货时间',
+  `completed_at` TIMESTAMP NULL DEFAULT NULL COMMENT '完成时间',
+  `canceled_at` TIMESTAMP NULL DEFAULT NULL COMMENT '取消时间',
   PRIMARY KEY (`order_id`),
+  INDEX `idx_order_no` (`order_no`),
   INDEX `idx_buyer` (`buyer_id`),
   INDEX `idx_seller` (`seller_id`),
   -- 关联到 user 表 (买家)
