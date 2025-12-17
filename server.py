@@ -5,7 +5,8 @@ import sys
 import os
 import base64
 import struct
-from datetime import datetime
+from datetime import datetime, date
+from decimal import Decimal
 from db_utils import DBManager
 
 # =================配置区域=================
@@ -39,6 +40,12 @@ os.makedirs(IMAGES_DIR, exist_ok=True)
 # 图片分片临时存储（用于拼接）
 image_chunks = {}  # {chunk_id: {chunks: [], total_size: int, filename: str}}
 
+# 客户端连接管理（用于消息推送）
+# 格式: {user_id: client_socket}
+connected_clients = {}
+# 线程锁，保护 connected_clients 字典的并发访问
+clients_lock = threading.Lock()
+
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     """循环读取指定长度，避免拆包问题"""
@@ -51,6 +58,52 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         chunks.append(part)
         total += len(part)
     return b"".join(chunks)
+
+def json_serialize(obj):
+    """将 Decimal、datetime、date 等类型转换为 JSON 可序列化的类型"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    elif isinstance(obj, datetime):
+        return obj.strftime('%Y-%m-%d %H:%M:%S')
+    elif isinstance(obj, date):
+        # 仅日期字段（例如 purchase_time）序列化为 YYYY-MM-DD
+        return obj.strftime('%Y-%m-%d')
+    elif isinstance(obj, dict):
+        return {key: json_serialize(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [json_serialize(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return [json_serialize(item) for item in obj]
+    return obj
+
+def push_message_to_client(user_id: int, cmd_type: str, data: dict):
+    """向指定用户推送消息
+    
+    Args:
+        user_id: 目标用户ID
+        cmd_type: 指令类型
+        data: 消息数据（字典）
+    """
+    with clients_lock:
+        client_socket = connected_clients.get(user_id)
+    
+    if client_socket:
+        try:
+            # 序列化数据
+            response_data = json_serialize(data)
+            response_str = f"{cmd_type}|{json.dumps(response_data, ensure_ascii=False)}"
+            resp_bytes = response_str.encode("utf-8")
+            resp_header = len(resp_bytes).to_bytes(HEADER_SIZE, "big")
+            client_socket.sendall(resp_header + resp_bytes)
+            print(f"[推送消息] 向用户 {user_id} 推送消息: {cmd_type}")
+        except Exception as e:
+            print(f"[推送失败] 向用户 {user_id} 推送消息失败: {e}")
+            # 如果推送失败，可能是连接已断开，清理连接
+            with clients_lock:
+                if connected_clients.get(user_id) == client_socket:
+                    del connected_clients[user_id]
+    else:
+        print(f"[推送失败] 用户 {user_id} 未在线，无法推送消息")
 # =========================================
 
 def handle_client_request(client_socket, client_addr):
@@ -89,6 +142,7 @@ def handle_client_request(client_socket, client_addr):
                     body = json.loads(json_body) if json_body else {}
                 except json.JSONDecodeError:
                     response_data = {"code": 400, "msg": "JSON格式错误"}
+                    response_data = json_serialize(response_data)
                     response_str = f"{cmd_type}|{json.dumps(response_data, ensure_ascii=False)}"
                     resp_bytes = response_str.encode("utf-8")
                     resp_header = len(resp_bytes).to_bytes(HEADER_SIZE, "big")
@@ -114,11 +168,11 @@ def handle_client_request(client_socket, client_addr):
                         response_data = {"code": 400, "msg": "缺少用户名或密码"}
                         print(f"[SERVER DEBUG] 注册失败: 缺少用户名或密码")
                     else:
-                        success, msg, error_code = db_manager.register_user(username, password, phone, nickname)
-                        print(f"[SERVER DEBUG] 注册结果: success={success}, msg={msg}, error_code={error_code}")
+                        success, msg, user_id, error_code = db_manager.register_user(username, password, phone, nickname)
+                        print(f"[SERVER DEBUG] 注册结果: success={success}, msg={msg}, user_id={user_id}, error_code={error_code}")
                         if success:
-                            # 成功：返回200
-                            response_data = {"code": 200, "msg": msg}
+                            # 成功：返回200和user_id
+                            response_data = {"code": 200, "msg": msg, "user_id": user_id}
                         else:
                             # 失败：根据错误类型返回不同错误码
                             # code 401: 用户名已存在（不可重复注册）
@@ -134,6 +188,7 @@ def handle_client_request(client_socket, client_addr):
                     # 2. 客户端通过 socket 发送 LOGIN 命令到服务器
                     # 3. 服务器验证：查询数据库检查用户是否存在、验证密码（MD5哈希比对）、检查账号状态
                     # 4. 服务器返回响应：成功（code 200）返回用户信息，失败（code 401）用户名或密码错误，失败（code 403）账号被封禁
+                    # 5. 登录成功时，记录用户ID和socket连接，用于消息推送
                     username = body.get("username")
                     password = body.get("password")
                     
@@ -142,7 +197,20 @@ def handle_client_request(client_socket, client_addr):
                     else:
                         success, msg, user_info, error_code = db_manager.validate_login(username, password)
                         if success:
-                            # 成功（code 200）：返回用户信息
+                            # 成功（code 200）：返回用户信息，并记录连接
+                            user_id = user_info.get("user_id")
+                            if user_id:
+                                with clients_lock:
+                                    # 如果该用户已有连接，先清理旧连接
+                                    if user_id in connected_clients:
+                                        old_socket = connected_clients[user_id]
+                                        try:
+                                            old_socket.close()
+                                        except:
+                                            pass
+                                    connected_clients[user_id] = client_socket
+                                    print(f"[连接管理] 用户 {user_id} ({username}) 已登录，连接已记录")
+                            
                             response_data = {
                                 "code": 200,
                                 "msg": msg,
@@ -319,14 +387,102 @@ def handle_client_request(client_socket, client_addr):
 
                     print(f"[SERVER DEBUG] 收到查询订单请求: buyer_id={buyer_id}, status={status}")
 
-                    if not buyer_id:
-                        response_data = {"code": 400, "msg": "缺少用户ID"}
-                    else:
-                        success, msg, orders = db_manager.get_orders(buyer_id, status)
-                        if success:
-                            response_data = {"code": 200, "msg": msg, "data": orders}
+                    try:
+                        if not buyer_id:
+                            response_data = {"code": 400, "msg": "缺少用户ID"}
                         else:
-                            response_data = {"code": 400, "msg": msg}
+                            # 确保 buyer_id 是整数类型
+                            buyer_id = int(buyer_id) if buyer_id else None
+                            success, msg, orders = db_manager.get_orders(buyer_id, status)
+                            print(f"[SERVER DEBUG] 查询订单结果: success={success}, msg={msg}, orders数量={len(orders) if orders else 0}")
+                            if success:
+                                response_data = {"code": 200, "msg": msg, "data": orders}
+                            else:
+                                response_data = {"code": 400, "msg": msg}
+                    except Exception as e:
+                        print(f"[SERVER ERROR] ORDER_GET 处理异常: {e}")
+                        import traceback
+                        print(traceback.format_exc())
+                        response_data = {"code": 500, "msg": f"查询订单失败: {str(e)}"}
+
+                elif cmd_type == "DATA_STAT":
+                    """
+                    数据统计接口：
+                    - 分类商品数量（柱状图/饼图）
+                    - 个人订单状态占比
+                    - 最近7天下单/成交趋势
+                    - 热门分类 TOP5（按成交量）
+                    - 个人喜爱度（按购买商品种类）
+                    - 简单时间序列外推：近7天成交量移动平均预测下周需求
+                    """
+                    user_id = body.get("user_id")  # 可选，用于个人相关统计
+                    print(f"[SERVER DEBUG] 收到数据统计请求: user_id={user_id}")
+
+                    try:
+                        # 1. 分类商品统计
+                        ok1, msg1, category_stats = db_manager.stat_category_goods()
+
+                        # 2. 用户订单状态统计（如果提供 user_id）
+                        user_order_stats = []
+                        if user_id:
+                            try:
+                                uid = int(user_id)
+                                ok2, msg2, user_order_stats = db_manager.stat_user_order_status(uid)
+                            except ValueError:
+                                user_order_stats = []
+
+                        # 3. 最近7天下单/成交趋势
+                        ok3, msg3, last7_trend = db_manager.stat_last_n_days_orders(7)
+
+                        # 4. 热门分类 TOP5（最近30天按成交量）
+                        ok4, msg4, hot_categories = db_manager.stat_hot_categories_top5(30)
+
+                        # 5. 用户偏好分类（购买次数）
+                        user_favorites = []
+                        if user_id:
+                            try:
+                                uid = int(user_id)
+                                ok5, msg5, user_favorites = db_manager.stat_user_favorite_categories(uid)
+                            except ValueError:
+                                user_favorites = []
+
+                        # 6. 最近7天成交量 + 简单预测（移动平均）
+                        ok6, msg6, last7_completed = db_manager.stat_last_n_days_completed(7)
+                        avg_completed = 0.0
+                        if last7_completed:
+                            total = sum(day["completed"] for day in last7_completed)
+                            avg_completed = total / len(last7_completed)
+
+                        # 构造下周7天的简单预测（使用固定平均值）
+                        next7_forecast = []
+                        today = datetime.now().date()
+                        for i in range(1, 8):
+                            day = today + timedelta(days=i)
+                            next7_forecast.append(
+                                {
+                                    "date": day.strftime("%Y-%m-%d"),
+                                    "predicted_completed": round(avg_completed, 2),
+                                }
+                            )
+
+                        response_data = {
+                            "code": 200,
+                            "msg": "统计成功",
+                            "data": {
+                                "category_counts": category_stats if ok1 else [],
+                                "my_order_status_ratio": user_order_stats,
+                                "last7_trend": last7_trend if ok3 else [],
+                                "hot_categories": hot_categories if ok4 else [],
+                                "my_favorite_categories": user_favorites,
+                                "last7_completed_daily": last7_completed if ok6 else [],
+                                "next7_forecast": next7_forecast,
+                            },
+                        }
+                    except Exception as e:
+                        print(f"[SERVER ERROR] DATA_STAT 处理异常: {e}")
+                        import traceback
+                        print(traceback.format_exc())
+                        response_data = {"code": 500, "msg": f"统计失败: {str(e)}"}
 
                 elif cmd_type == "COLLECT_ADD":
                     user_id = body.get("user_id")
@@ -359,6 +515,87 @@ def handle_client_request(client_socket, client_addr):
                     else:
                         success, msg = db_manager.del_collect(user_id, goods_id)
                         response_data = {"code": 200 if success else 400, "msg": msg}
+
+                elif cmd_type == "CHAT_SEND":
+                    # 发送聊天消息：保存到数据库，并推送给接收者
+                    sender_id = body.get("sender_id")
+                    receiver_id = body.get("receiver_id")
+                    content = body.get("content")
+                    
+                    print(f"[SERVER DEBUG] 收到发送消息请求: sender_id={sender_id}, receiver_id={receiver_id}")
+                    
+                    if not sender_id or not receiver_id or not content:
+                        response_data = {"code": 400, "msg": "缺少发送者ID、接收者ID或消息内容"}
+                    else:
+                        # 保存消息到数据库
+                        success, msg, message_id = db_manager.send_chat_message(sender_id, receiver_id, content)
+                        if success:
+                            # 查询刚发送的消息详情（包含发送时间等）
+                            message_data = db_manager.get_chat_message_by_id(message_id)
+                            
+                            response_data = {
+                                "code": 200,
+                                "msg": msg,
+                                "message_id": message_id,
+                                "message": message_data
+                            }
+                            
+                            # 推送给接收者（如果在线）
+                            if message_data:
+                                push_message_to_client(
+                                    receiver_id,
+                                    "CHAT_RECEIVE",
+                                    {
+                                        "code": 200,
+                                        "msg": "收到新消息",
+                                        "message": message_data
+                                    }
+                                )
+                        else:
+                            response_data = {"code": 400, "msg": msg}
+
+                elif cmd_type == "CHAT_GET":
+                    # 获取聊天历史记录
+                    user_id = body.get("user_id")
+                    other_user_id = body.get("other_user_id")
+                    limit = body.get("limit", 50)
+                    offset = body.get("offset", 0)
+                    
+                    print(f"[SERVER DEBUG] 收到获取聊天记录请求: user_id={user_id}, other_user_id={other_user_id}")
+                    
+                    if not user_id or not other_user_id:
+                        response_data = {"code": 400, "msg": "缺少用户ID或对方用户ID"}
+                    else:
+                        success, msg, messages = db_manager.get_chat_history(user_id, other_user_id, limit, offset)
+                        if success:
+                            response_data = {
+                                "code": 200,
+                                "msg": msg,
+                                "data": messages,
+                                "total": len(messages)
+                            }
+                        else:
+                            response_data = {"code": 400, "msg": msg}
+
+                elif cmd_type == "GOODS_UPDATE_STATUS":
+                    # 更新商品状态（不推荐使用，商品状态应由订单流程自动管理）
+                    # 此指令主要用于兼容性，建议通过订单流程来管理商品状态
+                    goods_id = body.get("goods_id")
+                    status = body.get("status")
+                    
+                    print(f"[SERVER DEBUG] 收到商品状态更新请求: goods_id={goods_id}, status={status}")
+                    
+                    if not goods_id or not status:
+                        response_data = {"code": 400, "msg": "缺少商品ID或状态参数"}
+                    elif status not in ('pending_review', 'on_sale', 'sold', 'rejected'):
+                        response_data = {"code": 400, "msg": "无效的商品状态"}
+                    else:
+                        # 使用审核方法来更新状态（复用代码）
+                        success, msg = db_manager.audit_goods(int(goods_id), status)
+                        if success:
+                            response_data = {"code": 200, "msg": msg}
+                        else:
+                            response_data = {"code": 400, "msg": msg}
 
                 elif cmd_type == "IMAGE_UPLOAD":
                     # 图片分片上传：接收客户端图片分片、拼接完整图片、保存到本地文件夹
@@ -449,11 +686,27 @@ def handle_client_request(client_socket, client_addr):
                     # 未知指令
                     response_data = {"code": 404, "msg": f"未知指令: {cmd_type}"}
 
-                # 4. 回包同样加长度头
-                response_str = f"{cmd_type}|{json.dumps(response_data, ensure_ascii=False)}"
-                resp_bytes = response_str.encode("utf-8")
-                resp_header = len(resp_bytes).to_bytes(HEADER_SIZE, "big")
-                client_socket.sendall(resp_header + resp_bytes)
+                # 4. 回包同样加长度头（转换 Decimal 和 datetime 类型）
+                try:
+                    response_data = json_serialize(response_data)
+                    response_str = f"{cmd_type}|{json.dumps(response_data, ensure_ascii=False)}"
+                    resp_bytes = response_str.encode("utf-8")
+                    resp_header = len(resp_bytes).to_bytes(HEADER_SIZE, "big")
+                    client_socket.sendall(resp_header + resp_bytes)
+                    print(f"[SERVER DEBUG] 已发送响应: {cmd_type}, 响应长度={len(resp_bytes)}")
+                except Exception as e:
+                    print(f"[SERVER ERROR] 发送响应失败: {e}")
+                    import traceback
+                    print(traceback.format_exc())
+                    # 尝试发送错误响应
+                    try:
+                        error_response = {"code": 500, "msg": f"服务器处理响应时出错: {str(e)}"}
+                        error_str = f"{cmd_type}|{json.dumps(error_response, ensure_ascii=False)}"
+                        error_bytes = error_str.encode("utf-8")
+                        error_header = len(error_bytes).to_bytes(HEADER_SIZE, "big")
+                        client_socket.sendall(error_header + error_bytes)
+                    except:
+                        pass
             else:
                 err_msg = "ERROR|格式错误，请使用 '指令|数据' 格式"
                 resp_bytes = err_msg.encode("utf-8")
@@ -467,7 +720,18 @@ def handle_client_request(client_socket, client_addr):
             print(f"[系统错误] 处理 {client_addr} 时发生错误: {e}")
             break
     
-    # 循环结束后关闭该客户端的 Socket
+    # 循环结束后关闭该客户端的 Socket，并清理连接映射
+    with clients_lock:
+        # 找到并删除该socket对应的用户连接
+        user_id_to_remove = None
+        for uid, sock in connected_clients.items():
+            if sock == client_socket:
+                user_id_to_remove = uid
+                break
+        if user_id_to_remove:
+            del connected_clients[user_id_to_remove]
+            print(f"[连接管理] 用户 {user_id_to_remove} 已断开连接，已清理映射")
+    
     client_socket.close()
 
 def start_server():
