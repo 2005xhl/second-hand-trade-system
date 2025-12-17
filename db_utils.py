@@ -4,7 +4,7 @@ import pymysql.cursors
 import os
 import random
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 class DBManager:
@@ -101,7 +101,7 @@ class DBManager:
         finally:
             conn.close()
 
-    def register_user(self, username: str, password: str, phone: str = None, nickname: str = None) -> Tuple[bool, str, Optional[int]]:
+    def register_user(self, username: str, password: str, phone: str = None, nickname: str = None) -> Tuple[bool, str, Optional[int], Optional[int]]:
         """实现注册逻辑：新增用户，密码MD5加密
         
         Args:
@@ -111,18 +111,19 @@ class DBManager:
             nickname: 昵称（可选，默认'新用户'）
         
         Returns:
-            (success: bool, message: str, error_code: int or None)
-            error_code: 401=用户名已存在（不可重复注册）, 500=服务器内部错误
+            (success: bool, message: str, user_id: int or None, error_code: int or None)
+            success=True时: user_id为注册成功的用户ID，error_code为None
+            success=False时: user_id为None，error_code为错误码（401=用户名已存在, 500=服务器内部错误）
         """
         
         # 1. 检查连接
         conn = self._get_conn()
         if not conn:
-            return False, "服务器数据库连接失败，请联系管理员", 500
+            return False, "服务器数据库连接失败，请联系管理员", None, 500
             
         # 2. 校验唯一性 - 如果用户名已存在，返回401错误码
         if self.get_user_by_username(username):
-             return False, "该用户名已被使用，不可重复注册，请更换其他用户名", 401
+             return False, "该用户名已被使用，不可重复注册，请更换其他用户名", None, 401
 
         # 3. 密码加密
         password_hash = self._md5(password)
@@ -141,8 +142,9 @@ class DBManager:
             print(f"[DB DEBUG] SQL执行完成，影响行数: {affected_rows}")
             # 确保提交（虽然 autocommit=True，但显式提交更安全）
             conn.commit()
-            print(f"[DB DEBUG] 用户注册成功: {username}, user_id={cur.lastrowid}")
-            return True, "注册成功", None
+            user_id = cur.lastrowid
+            print(f"[DB DEBUG] 用户注册成功: {username}, user_id={user_id}")
+            return True, "注册成功", user_id, None
         except pymysql.IntegrityError as e:
             # 捕获唯一性约束异常（并发注册或检查遗漏的情况）
             try:
@@ -152,10 +154,10 @@ class DBManager:
             error_code, error_msg = e.args if len(e.args) >= 2 else (e.args[0] if e.args else None, str(e))
             if error_code == 1062:  # Duplicate entry - 用户名重复
                 print(f"[DB EXEC ERROR] 用户名重复: {username}, 错误: {error_msg}")
-                return False, "该用户名已被使用，不可重复注册，请更换其他用户名", 401
+                return False, "该用户名已被使用，不可重复注册，请更换其他用户名", None, 401
             else:
                 print(f"[DB EXEC ERROR] 数据库完整性错误: {e}, 错误码: {error_code}")
-                return False, f"注册失败: 数据完整性错误", 500
+                return False, f"注册失败: 数据完整性错误", None, 500
         except Exception as e:
             print(f"[DB EXEC ERROR] 注册 SQL 失败: {e}")
             import traceback
@@ -165,7 +167,7 @@ class DBManager:
                 conn.rollback()
             except:
                 pass
-            return False, f"注册失败: {str(e)}", 500
+            return False, f"注册失败: {str(e)}", None, 500
         finally:
             if cur:
                 cur.close()
@@ -339,11 +341,11 @@ class DBManager:
         offset = (page - 1) * page_size
         list_sql = f"""SELECT g.goods_id, g.user_id, g.title, g.description, g.category,
                        g.brand, g.price, g.original_price, g.purchase_time,
-                       g.stock_quantity, g.sold_count, g.img_path, g.status, g.published_at,
+                       g.stock_quantity, g.sold_count, g.img_path, g.status, g.create_time,
                        (SELECT img_path FROM goods_images WHERE goods_id = g.goods_id
                         AND is_primary = 1 ORDER BY display_order LIMIT 1) as primary_image
                        FROM goods g {where_clause}
-                       ORDER BY g.published_at DESC LIMIT %s OFFSET %s"""
+                       ORDER BY g.create_time DESC LIMIT %s OFFSET %s"""
 
         cur = None
         try:
@@ -478,8 +480,8 @@ class DBManager:
             conn.autocommit(False)
             cur = conn.cursor(pymysql.cursors.DictCursor)
 
-            # 查询商品并锁定
-            cur.execute("SELECT goods_id, user_id, price, status FROM goods WHERE goods_id=%s FOR UPDATE", (goods_id,))
+            # 查询商品并锁定（包含库存信息）
+            cur.execute("SELECT goods_id, user_id, price, status, stock_quantity, sold_count FROM goods WHERE goods_id=%s FOR UPDATE", (goods_id,))
             goods = cur.fetchone()
             if not goods:
                 conn.rollback()
@@ -487,6 +489,12 @@ class DBManager:
             if goods["status"] != "on_sale":
                 conn.rollback()
                 return False, "商品不可下单（非在售状态）", None, None
+            
+            # 检查库存是否充足
+            current_stock = goods["stock_quantity"]
+            if current_stock < quantity:
+                conn.rollback()
+                return False, f"库存不足，当前库存：{current_stock}，需要：{quantity}", None, None
 
             seller_id = goods["user_id"]
             price = goods["price"]
@@ -501,8 +509,17 @@ class DBManager:
             )
             order_id = cur.lastrowid
 
-            # 更新商品状态为已售出
-            cur.execute("UPDATE goods SET status='sold' WHERE goods_id=%s", (goods_id,))
+            # 更新商品：状态改为已售出，减少库存，增加已售数量
+            new_stock = current_stock - quantity
+            new_sold_count = goods["sold_count"] + quantity
+            
+            # 如果库存为0，状态改为sold；如果还有库存，保持on_sale（允许继续销售）
+            new_status = 'sold' if new_stock == 0 else 'on_sale'
+            
+            cur.execute(
+                "UPDATE goods SET status=%s, stock_quantity=%s, sold_count=%s WHERE goods_id=%s",
+                (new_status, new_stock, new_sold_count, goods_id)
+            )
 
             conn.commit()
             print(f"[DB DEBUG] 订单创建成功: order_id={order_id}, order_no={order_no}")
@@ -527,7 +544,9 @@ class DBManager:
                 conn.close()
 
     def update_order_status(self, order_id: int, new_status: str) -> Tuple[bool, str]:
-        """按流程更新订单状态：pending_payment→pending_shipment→pending_receipt→completed"""
+        """按流程更新订单状态：pending_payment→pending_shipment→pending_receipt→completed
+        注意：订单取消时需要恢复商品库存
+        """
         allowed = {
             "pending_payment": "pending_shipment",
             "pending_shipment": "pending_receipt",
@@ -540,17 +559,46 @@ class DBManager:
 
         cur = None
         try:
+            conn.autocommit(False)
             cur = conn.cursor(pymysql.cursors.DictCursor)
-            cur.execute("SELECT status FROM `order` WHERE order_id=%s", (order_id,))
+            
+            # 查询订单信息（包含商品ID和数量）
+            cur.execute("SELECT status, goods_id, quantity FROM `order` WHERE order_id=%s FOR UPDATE", (order_id,))
             row = cur.fetchone()
             if not row:
+                conn.rollback()
                 return False, "订单不存在"
 
             current_status = row["status"]
-            expected_next = allowed.get(current_status)
-            if expected_next != new_status:
-                return False, f"非法的状态流转，当前状态 {current_status} 无法变更为 {new_status}"
+            
+            # 处理订单取消：恢复商品库存
+            if new_status == "canceled" and current_status != "canceled":
+                goods_id = row["goods_id"]
+                quantity = row["quantity"]
+                
+                # 恢复商品库存和状态
+                cur.execute("SELECT stock_quantity, sold_count, status FROM goods WHERE goods_id=%s FOR UPDATE", (goods_id,))
+                goods = cur.fetchone()
+                if goods:
+                    new_stock = goods["stock_quantity"] + quantity
+                    new_sold_count = max(0, goods["sold_count"] - quantity)
+                    # 如果商品状态是sold且恢复库存后>0，改回on_sale
+                    new_goods_status = 'on_sale' if (goods["status"] == 'sold' and new_stock > 0) else goods["status"]
+                    
+                    cur.execute(
+                        "UPDATE goods SET stock_quantity=%s, sold_count=%s, status=%s WHERE goods_id=%s",
+                        (new_stock, new_sold_count, new_goods_status, goods_id)
+                    )
+                    print(f"[DB DEBUG] 订单取消，恢复商品库存: goods_id={goods_id}, 恢复数量={quantity}")
+            
+            # 检查状态流转是否合法
+            elif new_status != "canceled":
+                expected_next = allowed.get(current_status)
+                if expected_next != new_status:
+                    conn.rollback()
+                    return False, f"非法的状态流转，当前状态 {current_status} 无法变更为 {new_status}"
 
+            # 更新订单状态
             cur.execute("UPDATE `order` SET status=%s WHERE order_id=%s", (new_status, order_id))
             conn.commit()
             print(f"[DB DEBUG] 订单状态更新成功: order_id={order_id}, {current_status} -> {new_status}")
@@ -609,6 +657,221 @@ class DBManager:
                 cur.close()
             if conn:
                 conn.close()
+
+    # ---------- 统计分析相关方法（用于 DATA_STAT） ----------
+    def stat_category_goods(self) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """统计各分类商品数量（总数 + 在售数）"""
+        conn = self._get_conn()
+        if not conn:
+            return False, "服务器数据库连接失败", []
+
+        sql = """
+            SELECT
+              category,
+              SUM(CASE WHEN status = 'on_sale' THEN 1 ELSE 0 END) AS on_sale_count,
+              COUNT(*) AS total_count
+            FROM goods
+            GROUP BY category
+            ORDER BY total_count DESC
+        """
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                return True, "查询成功", rows
+        except Exception as e:
+            print(f"[DB EXEC ERROR] 分类商品统计失败: {e}")
+            import traceback
+            print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
+            return False, f"查询失败: {str(e)}", []
+        finally:
+            conn.close()
+
+    def stat_user_order_status(self, buyer_id: int) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """统计某个用户的订单状态分布"""
+        conn = self._get_conn()
+        if not conn:
+            return False, "服务器数据库连接失败", []
+
+        sql = """
+            SELECT status, COUNT(*) AS cnt
+            FROM `order`
+            WHERE buyer_id = %s
+            GROUP BY status
+        """
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute(sql, (buyer_id,))
+                rows = cur.fetchall()
+                return True, "查询成功", rows
+        except Exception as e:
+            print(f"[DB EXEC ERROR] 用户订单状态统计失败: {e}")
+            import traceback
+            print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
+            return False, f"查询失败: {str(e)}", []
+        finally:
+            conn.close()
+
+    def stat_last_n_days_orders(self, days: int = 7) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """
+        统计最近 N 天下单数和成交数（按天）
+        返回列表：[{date: 'YYYY-MM-DD', orders: x, completed: y}, ...]
+        """
+        conn = self._get_conn()
+        if not conn:
+            return False, "服务器数据库连接失败", []
+
+        # 下单数（按 created_at）
+        orders_sql = """
+            SELECT DATE(created_at) AS dt, COUNT(*) AS orders
+            FROM `order`
+            WHERE created_at >= CURDATE() - INTERVAL %s DAY
+            GROUP BY DATE(created_at)
+        """
+        # 成交数（按 completed_at）
+        completed_sql = """
+            SELECT DATE(completed_at) AS dt, COUNT(*) AS completed
+            FROM `order`
+            WHERE status = 'completed'
+              AND completed_at IS NOT NULL
+              AND completed_at >= CURDATE() - INTERVAL %s DAY
+            GROUP BY DATE(completed_at)
+        """
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute(orders_sql, (days - 1,))
+                orders_rows = cur.fetchall()
+                cur.execute(completed_sql, (days - 1,))
+                completed_rows = cur.fetchall()
+
+            # 转成字典方便 merge
+            orders_map = {row["dt"].strftime("%Y-%m-%d"): row["orders"] for row in orders_rows}
+            completed_map = {
+                row["dt"].strftime("%Y-%m-%d"): row["completed"] for row in completed_rows
+            }
+
+            result: List[Dict[str, Any]] = []
+            today = datetime.now().date()
+            for i in range(days - 1, -1, -1):
+                day = today - timedelta(days=i)
+                key = day.strftime("%Y-%m-%d")
+                result.append(
+                    {
+                        "date": key,
+                        "orders": int(orders_map.get(key, 0)),
+                        "completed": int(completed_map.get(key, 0)),
+                    }
+                )
+
+            return True, "查询成功", result
+        except Exception as e:
+            print(f"[DB EXEC ERROR] 最近N天下单/成交统计失败: {e}")
+            import traceback
+            print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
+            return False, f"查询失败: {str(e)}", []
+        finally:
+            conn.close()
+
+    def stat_hot_categories_top5(self, days: int = 30) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """按成交量统计热门分类 TOP5（最近 days 天）"""
+        conn = self._get_conn()
+        if not conn:
+            return False, "服务器数据库连接失败", []
+
+        sql = """
+            SELECT
+              g.category,
+              COUNT(*) AS completed_orders
+            FROM `order` o
+            JOIN goods g ON o.goods_id = g.goods_id
+            WHERE o.status = 'completed'
+              AND o.completed_at IS NOT NULL
+              AND o.completed_at >= CURDATE() - INTERVAL %s DAY
+            GROUP BY g.category
+            ORDER BY completed_orders DESC
+            LIMIT 5
+        """
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute(sql, (days,))
+                rows = cur.fetchall()
+                return True, "查询成功", rows
+        except Exception as e:
+            print(f"[DB EXEC ERROR] 热门分类统计失败: {e}")
+            import traceback
+            print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
+            return False, f"查询失败: {str(e)}", []
+        finally:
+            conn.close()
+
+    def stat_user_favorite_categories(self, buyer_id: int) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """按已完成订单统计用户的偏好分类（购买次数）"""
+        conn = self._get_conn()
+        if not conn:
+            return False, "服务器数据库连接失败", []
+
+        sql = """
+            SELECT
+              g.category,
+              COUNT(*) AS buy_count
+            FROM `order` o
+            JOIN goods g ON o.goods_id = g.goods_id
+            WHERE o.buyer_id = %s
+              AND o.status = 'completed'
+            GROUP BY g.category
+            ORDER BY buy_count DESC
+        """
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute(sql, (buyer_id,))
+                rows = cur.fetchall()
+                return True, "查询成功", rows
+        except Exception as e:
+            print(f"[DB EXEC ERROR] 用户偏好分类统计失败: {e}")
+            import traceback
+            print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
+            return False, f"查询失败: {str(e)}", []
+        finally:
+            conn.close()
+
+    def stat_last_n_days_completed(self, days: int = 7) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """
+        统计最近 N 天每天的成交数量，用于移动平均 / 预测
+        返回：[{date: 'YYYY-MM-DD', completed: x}, ...]
+        """
+        conn = self._get_conn()
+        if not conn:
+            return False, "服务器数据库连接失败", []
+
+        sql = """
+            SELECT DATE(completed_at) AS dt, COUNT(*) AS completed
+            FROM `order`
+            WHERE status = 'completed'
+              AND completed_at IS NOT NULL
+              AND completed_at >= CURDATE() - INTERVAL %s DAY
+            GROUP BY DATE(completed_at)
+        """
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute(sql, (days - 1,))
+                rows = cur.fetchall()
+
+            completed_map = {row["dt"].strftime("%Y-%m-%d"): row["completed"] for row in rows}
+            result: List[Dict[str, Any]] = []
+            today = datetime.now().date()
+            for i in range(days - 1, -1, -1):
+                day = today - timedelta(days=i)
+                key = day.strftime("%Y-%m-%d")
+                result.append({"date": key, "completed": int(completed_map.get(key, 0))})
+
+            return True, "查询成功", result
+        except Exception as e:
+            print(f"[DB EXEC ERROR] 最近N天成交统计失败: {e}")
+            import traceback
+            print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
+            return False, f"查询失败: {str(e)}", []
+        finally:
+            conn.close()
 
     # ---------- 收藏相关 ----------
     def add_collect(self, user_id: int, goods_id: int) -> Tuple[bool, str]:
@@ -791,11 +1054,11 @@ class DBManager:
         offset = (page - 1) * page_size
         list_sql = f"""SELECT g.goods_id, g.user_id, g.title, g.description, g.category, 
                        g.brand, g.price, g.original_price, g.purchase_time, 
-                       g.stock_quantity, g.sold_count, g.img_path, g.status, g.published_at,
+                       g.stock_quantity, g.sold_count, g.img_path, g.status, g.create_time,
                        (SELECT img_path FROM goods_images WHERE goods_id = g.goods_id 
                         AND is_primary = 1 ORDER BY display_order LIMIT 1) as primary_image
                        FROM goods g {where_clause} 
-                       ORDER BY g.published_at DESC LIMIT %s OFFSET %s"""
+                       ORDER BY g.create_time DESC LIMIT %s OFFSET %s"""
         
         cur = None
         try:
@@ -914,6 +1177,121 @@ class DBManager:
             except:
                 pass
             return False, f"添加图片失败: {str(e)}"
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+    
+    # ---------- 聊天相关方法 ----------
+    def send_chat_message(self, sender_id: int, receiver_id: int, content: str) -> Tuple[bool, str, Optional[int]]:
+        """发送聊天消息
+        
+        Args:
+            sender_id: 发送者用户ID
+            receiver_id: 接收者用户ID
+            content: 消息内容
+        
+        Returns:
+            (success: bool, message: str, message_id: int or None)
+        """
+        conn = self._get_conn()
+        if not conn:
+            return False, "服务器数据库连接失败，请联系管理员", None
+        
+        if not content or not content.strip():
+            return False, "消息内容不能为空", None
+        
+        if sender_id == receiver_id:
+            return False, "不能给自己发送消息", None
+        
+        sql = """INSERT INTO chat (sender_id, receiver_id, content) 
+                 VALUES (%s, %s, %s)"""
+        cur = None
+        try:
+            cur = conn.cursor()
+            print(f"[DB DEBUG] 准备发送消息: sender_id={sender_id}, receiver_id={receiver_id}")
+            cur.execute(sql, (sender_id, receiver_id, content.strip()))
+            message_id = cur.lastrowid
+            conn.commit()
+            print(f"[DB DEBUG] 消息发送成功: message_id={message_id}")
+            return True, "消息发送成功", message_id
+        except Exception as e:
+            print(f"[DB EXEC ERROR] 发送消息失败: {e}")
+            import traceback
+            print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
+            try:
+                conn.rollback()
+            except:
+                pass
+            return False, f"发送消息失败: {str(e)}", None
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+    
+    def get_chat_message_by_id(self, message_id: int) -> Optional[Dict[str, Any]]:
+        """根据消息ID获取消息详情
+        
+        Args:
+            message_id: 消息ID
+        
+        Returns:
+            消息字典，包含: message_id, sender_id, receiver_id, content, sent_at
+        """
+        conn = self._get_conn()
+        if not conn:
+            return None
+        
+        sql = """SELECT message_id, sender_id, receiver_id, content, sent_at
+                 FROM chat
+                 WHERE message_id = %s"""
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute(sql, (message_id,))
+                return cur.fetchone()
+        except Exception as e:
+            print(f"[DB EXEC ERROR] 查询消息失败: {e}")
+            return None
+        finally:
+            conn.close()
+    
+    def get_chat_history(self, user_id: int, other_user_id: int, limit: int = 50, offset: int = 0) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """获取聊天历史记录（两人之间的对话）
+        
+        Args:
+            user_id: 当前用户ID
+            other_user_id: 对方用户ID
+            limit: 返回消息数量限制（默认50）
+            offset: 偏移量（用于分页，默认0）
+        
+        Returns:
+            (success: bool, message: str, messages: List[Dict])
+            每条消息包含: message_id, sender_id, receiver_id, content, sent_at
+        """
+        conn = self._get_conn()
+        if not conn:
+            return False, "服务器数据库连接失败", []
+        
+        sql = """SELECT message_id, sender_id, receiver_id, content, sent_at
+                 FROM chat
+                 WHERE (sender_id = %s AND receiver_id = %s) 
+                    OR (sender_id = %s AND receiver_id = %s)
+                 ORDER BY sent_at ASC
+                 LIMIT %s OFFSET %s"""
+        cur = None
+        try:
+            cur = conn.cursor(pymysql.cursors.DictCursor)
+            cur.execute(sql, (user_id, other_user_id, other_user_id, user_id, limit, offset))
+            messages = cur.fetchall()
+            print(f"[DB DEBUG] 查询聊天记录成功: user_id={user_id}, other_user_id={other_user_id}, 返回{len(messages)}条")
+            return True, "查询成功", messages
+        except Exception as e:
+            print(f"[DB EXEC ERROR] 查询聊天记录失败: {e}")
+            import traceback
+            print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
+            return False, f"查询失败: {str(e)}", []
         finally:
             if cur:
                 cur.close()
