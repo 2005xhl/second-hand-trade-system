@@ -12,7 +12,7 @@ import re
 import json
 from urllib.parse import urljoin, urlparse
 import pymysql
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 
 
@@ -123,14 +123,19 @@ class ProductSpider:
             # 如果没有seller_id，使用默认值1（或创建一个默认卖家）
             seller_id = product_data.get('seller_id', 1)
             
-            # 插入商品数据
-            # 注意：condition是MySQL保留关键字，需要用反引号括起来
+            # 插入商品数据（字段需与 used_goods_platform.sql 中的 goods 表结构对齐）
+            # 当前 goods 表关键字段：
+            # user_id, title, description, category, brand, price, original_price,
+            # purchase_time, stock_quantity, sold_count, img_path, status, create_time
             insert_sql = """
                 INSERT INTO goods (
-                    user_id, title, category, price, original_price,
-                    `condition`, description, img_path, status, create_time
+                    user_id, title, description, category, brand,
+                    price, original_price, purchase_time,
+                    stock_quantity, sold_count, img_path, status, create_time
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s, %s
                 )
             """
             
@@ -139,16 +144,32 @@ class ProductSpider:
             if isinstance(img_path, list):
                 img_path = ','.join(img_path)
             
+            # 简单设置：
+            # - brand 使用来源平台或分类名
+            # - purchase_time 使用当前日期前若干天
+            # - stock_quantity 默认 1，sold_count 默认 0
+            # - status 使用 'pending_review'，后续由审核 / 上架流程控制
+            brand = product_data.get('brand') or 'SpiderBrand'
+            description = product_data.get('description', '')
+            category = product_data.get('category', '其他')
+            price = product_data.get('price', 0)
+            original_price = product_data.get('original_price')
+            purchase_days_ago = random.randint(30, 365)
+            purchase_time = datetime.now() - timedelta(days=purchase_days_ago)
+            
             values = (
                 seller_id,  # user_id (卖家ID)
                 product_data.get('title', ''),
-                product_data.get('category', '其他'),
-                product_data.get('price', 0),
-                product_data.get('original_price'),
-                product_data.get('condition', '99新'),
-                product_data.get('description', ''),
+                description,
+                category,
+                brand,
+                price,
+                original_price,
+                purchase_time.date(),  # DATE 类型
+                1,          # stock_quantity
+                0,          # sold_count
                 img_path,
-                'pending',  # 状态：待审核
+                'pending_review',  # 状态：待审核
                 datetime.now()
             )
             
@@ -520,4 +541,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
