@@ -5,7 +5,7 @@ import sys
 import os
 import base64
 import struct
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 from db_utils import DBManager
 
@@ -283,7 +283,7 @@ def handle_client_request(client_socket, client_addr):
                     original_price = body.get("original_price")
                     purchase_time = body.get("purchase_time")
                     stock_quantity = body.get("stock_quantity", 1)
-                    img_path = body.get("img_path")  # 主图路径（可选）
+                    img_path = body.get("img_path")  # 主图路径或图片列表（可选）
                     
                     print(f"[SERVER DEBUG] 收到发布商品请求: user_id={user_id}, title={title}")
                     
@@ -297,6 +297,19 @@ def handle_client_request(client_socket, client_addr):
                         )
                         print(f"[SERVER DEBUG] 商品发布结果: success={success}, goods_id={goods_id}")
                         if success:
+                            # 如果请求中带了 img_path，同步写入 goods_images 表，兼容多图
+                            try:
+                                print(f"[SERVER DEBUG] GOODS_ADD 中收到的 img_path: {img_path} (type={type(img_path)})")
+                                if img_path:
+                                    # 支持字符串或列表
+                                    paths = img_path if isinstance(img_path, list) else [img_path]
+                                    for idx, p in enumerate(paths):
+                                        is_primary = 1 if idx == 0 else 0
+                                        # 这里不关心返回值，失败会在日志打印
+                                        db_manager.add_goods_image(goods_id, p, idx, is_primary)
+                            except Exception as e:
+                                print(f"[SERVER WARN] 根据 GOODS_ADD.img_path 写入 goods_images 失败: {e}")
+
                             response_data = {"code": 200, "msg": msg, "goods_id": goods_id}
                         else:
                             response_data = {"code": 400, "msg": msg}
@@ -652,7 +665,21 @@ def handle_client_request(client_socket, client_addr):
                                 
                                 # 如果提供了goods_id，自动添加到商品图片表
                                 if goods_id:
-                                    db_manager.add_goods_image(goods_id, relative_path, display_order, is_primary)
+                                    try:
+                                        gid_int = int(goods_id)
+                                    except Exception:
+                                        gid_int = goods_id
+                                    db_manager.add_goods_image(gid_int, relative_path, display_order, is_primary)
+                                    # 如果是主图，顺便更新 goods 表的 img_path，便于兼容旧字段
+                                    if is_primary:
+                                        try:
+                                            conn_tmp = db_manager._get_conn()
+                                            if conn_tmp:
+                                                with conn_tmp.cursor() as cur_tmp:
+                                                    cur_tmp.execute("UPDATE goods SET img_path=%s WHERE goods_id=%s", (relative_path, gid_int))
+                                                conn_tmp.close()
+                                        except Exception as e:
+                                            print(f"[SERVER WARN] 更新主图到 goods.img_path 失败: {e}")
                                 
                                 # 清理分片数据
                                 del image_chunks[chunk_id]
