@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse
 import pymysql
 from datetime import datetime, timedelta
 import hashlib
+from PIL import Image, ImageDraw, ImageFont
 
 
 class ProductSpider:
@@ -389,9 +390,6 @@ class MockSpider(ProductSpider):
             return
         
         try:
-            import random
-            from PIL import Image, ImageDraw, ImageFont
-            
             for i in range(max_items):
                 category = random.choice(self.categories)
                 keyword = random.choice(self.keywords[category])
@@ -404,8 +402,7 @@ class MockSpider(ProductSpider):
                     'condition': condition,
                     'description': f"这是一件{condition}的{keyword}，功能完好，欢迎咨询。",
                     'category': category,
-                    'img_path': [],  # 先不设置图片，保存后获取ID再生成
-                    'seller_id': random.randint(1, 10)  # 随机卖家ID
+                    'img_path': []  # 先不设置图片，保存后获取ID再生成
                 }
                 
                 # 先保存商品获取真实ID
