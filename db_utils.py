@@ -5,6 +5,7 @@ import os
 import random
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
+from db_concurrency import ConcurrencyControl
 
 
 class DBManager:
@@ -18,6 +19,8 @@ class DBManager:
         self.user = user
         self.password = password
         self.database = database
+        # 初始化并发控制工具
+        self.concurrency = ConcurrencyControl(self)
         print(f"[DB INFO] 数据库管理器初始化完成，HOST: {host}, DB: {database}")
 
     # ---------- 工具方法 ----------
@@ -210,27 +213,47 @@ class DBManager:
             conn.close()
             
     def update_user_status(self, user_id: int, status: str) -> Tuple[bool, str]:
-        conn = self._get_conn()
-        if not conn: return False, "服务器数据库连接失败"
-        
+        """更新用户状态 - 使用行锁防止并发冲突"""
         if user_id is None or status not in ("active", "blocked"):
             return False, "参数错误"
 
-        sql = "UPDATE user SET status=%s WHERE user_id=%s"
         try:
-            with conn.cursor() as cur:
-                affected_rows = cur.execute(sql, (status, user_id))
-            if affected_rows == 0:
-                return False, "未找到该用户ID"
-            return True, f"用户ID {user_id} 状态更新为 {status} 成功"
+            with self.concurrency.transaction(isolation_level="REPEATABLE READ") as conn:
+                # 使用行锁查询，防止并发修改
+                user = self.concurrency.select_for_update(
+                    conn,
+                    "user",
+                    "user_id = %s",
+                    (user_id,)
+                )
+                
+                if not user:
+                    return False, "未找到该用户ID"
+                
+                # 检查状态是否相同
+                if user.get("status") == status:
+                    return True, f"用户状态已经是 {status}，无需重复操作"
+                
+                # 更新状态
+                cur = conn.cursor()
+                affected_rows = cur.execute(
+                    "UPDATE user SET status=%s WHERE user_id=%s",
+                    (status, user_id)
+                )
+                
+                if affected_rows == 0:
+                    return False, "更新失败"
+                
+                return True, f"用户ID {user_id} 状态更新为 {status} 成功"
+                
         except Exception as e:
             print(f"[DB EXEC ERROR] 更新用户状态失败: {e}")
+            import traceback
+            print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
             return False, f"更新失败: {str(e)}"
-        finally:
-            conn.close()
     
     def update_user_nickname(self, username: str, nickname: str) -> Tuple[bool, str]:
-        """更新用户昵称
+        """更新用户昵称 - 使用行锁防止并发冲突
         
         Args:
             username: 用户名（用于标识要修改的用户）
@@ -239,47 +262,44 @@ class DBManager:
         Returns:
             (success: bool, message: str)
         """
-        conn = self._get_conn()
-        if not conn:
-            return False, "服务器数据库连接失败，请联系管理员"
-        
         if not username or not nickname:
             return False, "缺少用户名或昵称"
         
-        # 检查用户是否存在
-        user = self.get_user_by_username(username)
-        if not user:
-            return False, "用户不存在"
-        
-        sql = "UPDATE user SET nickname=%s WHERE username=%s"
-        cur = None
         try:
-            cur = conn.cursor()
-            print(f"[DB DEBUG] 准备更新用户昵称: username={username}, new_nickname={nickname}")
-            affected_rows = cur.execute(sql, (nickname, username))
-            print(f"[DB DEBUG] SQL执行完成，影响行数: {affected_rows}")
-            conn.commit()
-            
-            if affected_rows == 0:
-                print(f"[DB DEBUG] 未找到用户: {username}")
-                return False, "未找到该用户"
-            
-            print(f"[DB DEBUG] 用户昵称更新成功: username={username}, nickname={nickname}")
-            return True, "昵称修改成功"
+            with self.concurrency.transaction(isolation_level="REPEATABLE READ") as conn:
+                # 使用行锁查询，防止并发修改
+                user = self.concurrency.select_for_update(
+                    conn,
+                    "user",
+                    "username = %s",
+                    (username,)
+                )
+
+                if not user:
+                    return False, "用户不存在"
+                
+                # 检查昵称是否相同
+                if user.get("nickname") == nickname:
+                    return True, "昵称未变化，无需更新"
+                
+                # 更新昵称
+                cur = conn.cursor()
+                print(f"[DB DEBUG] 准备更新用户昵称: username={username}, new_nickname={nickname}")
+                affected_rows = cur.execute(
+                    "UPDATE user SET nickname=%s WHERE username=%s",
+                    (nickname, username)
+                )
+                
+                if affected_rows == 0:
+                    return False, "更新失败"
+                
+                print(f"[DB DEBUG] 用户昵称更新成功: username={username}, nickname={nickname}")
+                return True, "昵称修改成功"
         except Exception as e:
             print(f"[DB EXEC ERROR] 更新用户昵称失败: {e}")
             import traceback
             print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
-            try:
-                conn.rollback()
-            except:
-                pass
             return False, f"更新失败: {str(e)}"
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
 
     # ---------- 商品相关方法 ----------
     def add_goods(self, user_id: int, title: str, description: str, category: str,
@@ -381,42 +401,44 @@ class DBManager:
                 conn.close()
 
     def audit_goods(self, goods_id: int, status: str, admin_user_id: int = None) -> Tuple[bool, str]:
-        """审核商品（管理员操作）"""
+        """审核商品（管理员操作）- 使用行锁防止并发冲突"""
         if status not in ('on_sale', 'rejected'):
             return False, "无效的状态值，只能设置为 'on_sale'（在售）或 'rejected'（驳回）"
 
-        conn = self._get_conn()
-        if not conn:
-            return False, "服务器数据库连接失败"
-
-        sql = "UPDATE goods SET status = %s WHERE goods_id = %s"
-        cur = None
         try:
-            cur = conn.cursor()
-            print(f"[DB DEBUG] 准备审核商品: goods_id={goods_id}, status={status}")
-            affected_rows = cur.execute(sql, (status, goods_id))
-            conn.commit()
+            with self.concurrency.transaction(isolation_level="REPEATABLE READ") as conn:
+                # 使用行锁查询，防止审核期间商品被修改
+                goods = self.concurrency.select_for_update(
+                    conn, 
+                    "goods", 
+                    "goods_id = %s", 
+                    (goods_id,)
+                )
 
-            if affected_rows == 0:
-                return False, "商品不存在"
+                if not goods:
+                    return False, "商品不存在"
 
-            print(f"[DB DEBUG] 商品审核成功: goods_id={goods_id}, status={status}")
-            status_msg = "已通过审核，商品已上架" if status == 'on_sale' else "审核未通过，商品已驳回"
-            return True, status_msg
+                # 检查当前状态
+                current_status = goods.get("status")
+                if current_status == status:
+                    return True, f"商品状态已经是 {status}，无需重复操作"
+                
+                # 更新状态
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE goods SET status = %s WHERE goods_id = %s",
+                    (status, goods_id)
+                )
+                
+                print(f"[DB DEBUG] 商品审核成功: goods_id={goods_id}, {current_status} -> {status}")
+                status_msg = "已通过审核，商品已上架" if status == 'on_sale' else "审核未通过，商品已驳回"
+                return True, status_msg
+                
         except Exception as e:
             print(f"[DB EXEC ERROR] 审核商品失败: {e}")
             import traceback
             print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
-            try:
-                conn.rollback()
-            except:
-                pass
             return False, f"审核失败: {str(e)}"
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
 
     def add_goods_image(self, goods_id: int, img_path: str, display_order: int = 0,
                         is_primary: int = 0) -> Tuple[bool, str]:
@@ -871,7 +893,7 @@ class DBManager:
             print(f"[DB EXEC ERROR] 详细错误信息: {traceback.format_exc()}")
             return False, f"查询失败: {str(e)}", []
         finally:
-            conn.close()
+                conn.close()
 
     # ---------- 收藏相关 ----------
     def add_collect(self, user_id: int, goods_id: int) -> Tuple[bool, str]:
